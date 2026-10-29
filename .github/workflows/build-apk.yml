@@ -1,0 +1,127 @@
+name: Build universal APK
+
+# Both packages contain only shell/ucode/JS files, so PKGARCH=all is valid:
+# one build produces an APK that installs on every OpenWrt 25 architecture.
+# Tag v* -> build + attach APKs to the GitHub release.
+# Manual run -> build + upload workflow artifact only.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: 'OpenWrt SDK release'
+        required: false
+        default: '25.12.6'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDK_VERSION: ${{ github.event.inputs.sdk_version || '25.12.6' }}
+  SDK_TARGET: x86/64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify architecture-independent packages
+        run: |
+          set -euo pipefail
+          grep -qE '^[[:space:]]*PKGARCH:=all[[:space:]]*$' packages/mrdark-core/Makefile
+          grep -qE '^[[:space:]]*LUCI_PKGARCH:=all[[:space:]]*$' packages/luci-app-mrdark/Makefile
+          echo "mrdark-core and luci-app-mrdark are marked all/noarch"
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential bison flex gawk gettext libncurses-dev libssl-dev \
+            python3 rsync unzip zlib1g-dev zstd
+
+      - name: Download OpenWrt SDK
+        run: |
+          set -euo pipefail
+          base="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${SDK_TARGET}/"
+          sdk_file="$(curl -fsSL "$base" | grep -oE 'openwrt-sdk-[^"]+Linux-x86_64\.tar\.zst' | sed -n '1p' || true)"
+          if [ -z "$sdk_file" ]; then
+            echo "OpenWrt SDK not found at $base" >&2
+            exit 1
+          fi
+          echo "Downloading ${base}${sdk_file}"
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/sdk.tar.zst "${base}${sdk_file}"
+          mkdir -p "$RUNNER_TEMP/sdk"
+          tar --zstd -xf /tmp/sdk.tar.zst -C "$RUNNER_TEMP/sdk" --strip-components=1
+          rm -f /tmp/sdk.tar.zst
+          echo "SDK_DIR=$RUNNER_TEMP/sdk" >> "$GITHUB_ENV"
+
+      - name: Build packages
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          rm -rf package/mrdark-core package/luci-app-mrdark
+          cp -r "$GITHUB_WORKSPACE/packages/mrdark-core" package/
+          cp -r "$GITHUB_WORKSPACE/packages/luci-app-mrdark" package/
+
+          # OpenWrt only enables the compile target of selected packages.
+          if [ -f .config ]; then
+            sed -i '/^CONFIG_PACKAGE_mrdark-core/d; /^CONFIG_PACKAGE_luci-app-mrdark/d; /^CONFIG_PACKAGE_luci-base/d' .config
+          fi
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_mrdark-core=y
+          CONFIG_PACKAGE_luci-app-mrdark=y
+          CONFIG_PACKAGE_luci-base=y
+          EOF
+
+          make defconfig
+          # luci.mk declares luci-base/host and lua/host as build dependencies;
+          # the OpenWrt build system builds them before the LuCI app.
+          make package/mrdark-core/compile V=s
+          make package/luci-app-mrdark/compile V=s
+
+      - name: Collect APK files
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "$SDK_DIR/bin/packages" -type f \
+            \( -name 'mrdark-core-*.apk' -o -name 'luci-app-mrdark-*.apk' \) \
+            -exec cp -v {} dist/ \;
+          count="$(find dist -maxdepth 1 -type f -name '*.apk' | wc -l)"
+          test "$count" -eq 2
+          (cd dist && sha256sum ./*.apk > SHA256SUMS)
+          ls -lh dist
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: darkcapture-wrt-universal-apk
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach APK files to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          make_latest: true
+          token: ${{ secrets.GITHUB_TOKEN }}

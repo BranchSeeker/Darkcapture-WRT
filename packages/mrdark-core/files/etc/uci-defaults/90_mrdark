@@ -1,0 +1,30 @@
+#!/bin/sh
+# First-install defaults. Runs once, before the service is enabled.
+
+[ -f /etc/config/mrdark ] || exit 0
+
+# make sure the main section exists and has sane values
+uci -q get mrdark.main >/dev/null 2>&1 || uci set mrdark.main=mrdark
+
+for kv in \
+	phy=auto scratch_dir=/tmp/mrdark artifacts_dir=/root/cap \
+	storage_max_mb=2 scan_duration=30 attempt_window=20 \
+	deauth_count=5 deauth_bursts=2 deauth_timeout=20 caps_target=3 retry_interval=60 success_interval=60 \
+	max_fails_in_row=0 max_attempts_total=0 cyclic_pause=0 deauth_mode=auto \
+	keep_monitor=1 hc22000=auto on_finish=idle autostart=0 log_level=info confirm_authorized=0
+do
+	k=${kv%%=*}
+	v=${kv#*=}
+	[ -n "$(uci -q get mrdark.main.$k)" ] || uci set mrdark.main.$k="$v"
+done
+
+uci commit mrdark
+
+mkdir -p /root/cap
+chmod 0700 /root/cap
+
+# the worker must be running to accept commands from CLI/LuCI
+/etc/init.d/mrdark enable
+/etc/init.d/mrdark restart 2>/dev/null
+
+exit 0

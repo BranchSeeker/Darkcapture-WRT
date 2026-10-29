@@ -1,0 +1,29 @@
+# mrdark configuration
+# see /usr/share/doc/mrdark/README.md (or the LuCI app) for the meaning
+
+config mrdark 'main'
+	option enabled '1'
+	option phy 'auto'
+	option scratch_dir '/tmp/mrdark'
+	option artifacts_dir '/root/cap'
+	option storage_max_mb '2'
+
+	option scan_duration '30'
+	option attempt_window '20'
+	option deauth_count '5'
+	option deauth_bursts '2'
+	option deauth_timeout '20'
+	option caps_target '3'
+	option retry_interval '60'
+	option success_interval '60'
+	option max_fails_in_row '0'
+	option max_attempts_total '0'
+	option cyclic_pause '0'
+
+	option deauth_mode 'auto'
+	option keep_monitor '1'
+	option hc22000 'auto'
+	option on_finish 'idle'
+	option autostart '0'
+	option log_level 'info'
+	option confirm_authorized '0'

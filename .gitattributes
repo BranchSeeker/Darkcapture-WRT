@@ -1,0 +1,14 @@
+* text=auto
+
+*.sh text eol=lf
+*.uc text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+Makefile text eol=lf
+LICENSE text eol=lf
+mrdark text eol=lf
+mrdark-verify text eol=lf
+90_mrdark text eol=lf

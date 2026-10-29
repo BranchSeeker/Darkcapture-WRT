@@ -1,0 +1,30 @@
+# Local research / scratch, not part of the product
+.origin/
+.tmp/
+
+# Build outputs
+*.apk
+*.ipk
+*.tar.gz
+*.zip
+/bin/
+/build_dir/
+/staging_dir/
+/dl/
+/feeds/
+/package/
+/logs/
+/dist/
+*.log
+
+# Captures and test artefacts
+*.pcap
+*.cap
+*.22000
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/

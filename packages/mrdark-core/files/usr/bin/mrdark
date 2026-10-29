@@ -1,0 +1,192 @@
+#!/bin/sh
+# mrdark - CLI for the mrdark core. Works with or without LuCI.
+
+. /usr/libexec/mrdark/lib.sh
+
+ensure_worker() {
+	if ! pgrep -f "mrdark/worker.sh" >/dev/null 2>&1; then
+		/etc/init.d/mrdark start >/dev/null 2>&1
+		sleep 1
+	fi
+}
+
+send_cmd() {
+	mrd_init_dirs
+	ensure_worker
+	printf '%s\n' "$1" >"$MRD_CMD"
+	sleep 1
+}
+
+usage() {
+	cat <<EOF
+mrdark - EAPOL capture lab tool
+
+  mrdark scan [--json] [--wait]      scan the air (2.4GHz) and list networks
+  mrdark target add <bssid> <ch> [essid]
+  mrdark target list
+  mrdark target del <section|bssid>
+  mrdark start                       start the job on the current queue
+  mrdark stop | pause | resume | skip
+  mrdark status [--json]
+  mrdark log [-n N]
+  mrdark artifacts
+  mrdark verify <file.pcap> [--bssid BSSID]
+EOF
+}
+
+cmd_status() {
+	if [ "$1" = "--json" ]; then
+		cat "$MRD_TMP/status.json" 2>/dev/null
+		return $?
+	fi
+	/usr/libexec/mrdark/mrdark-status.uc "$(date +%s)"
+}
+
+cmd_scan() {
+	_json=
+	for a in "$@"; do
+		case "$a" in
+			--json) _json=1 ;;
+		esac
+	done
+
+	send_cmd scan
+
+	_i=0
+	while [ "$_i" -lt 120 ]; do
+		_st=$(grep -o '"scan":{"state":"[^"]*"' "$MRD_TMP/status.json" 2>/dev/null |
+			sed 's/.*"state":"//; s/"$//')
+		case "$_st" in
+			done|error) break ;;
+		esac
+		sleep 1
+		_i=$((_i + 1))
+	done
+
+	if [ -n "$_json" ]; then
+		cat "$MRD_SCAN/networks.json" 2>/dev/null
+		return 0
+	fi
+
+	/usr/libexec/mrdark/mrdark-net.uc "$MRD_SCAN/networks.json" 2>/dev/null || {
+		printf '%-18s %-24s %-3s %-5s %-10s %s\n' BSSID ESSID CH SIG ENC CLIENTS
+		sed -e 's/},{/}\n{/g' -e 's/^\[//' -e 's/\]$//' "$MRD_SCAN/networks.json" 2>/dev/null |
+			while IFS= read -r row; do
+				b=$(printf '%s' "$row" | sed -n 's/.*"bssid":"\([^"]*\)".*/\1/p')
+				e=$(printf '%s' "$row" | sed -n 's/.*"essid":"\([^"]*\)".*/\1/p')
+				c=$(printf '%s' "$row" | sed -n 's/.*"channel":\([0-9]*\).*/\1/p')
+				s=$(printf '%s' "$row" | sed -n 's/.*"rssi":\(-\{0,1\}[0-9]*\).*/\1/p')
+				x=$(printf '%s' "$row" | sed -n 's/.*"enc":"\([^"]*\)".*/\1/p')
+				n=$(printf '%s' "$row" | sed -n 's/.*"clients":\([0-9]*\).*/\1/p')
+				printf '%-18s %-24s %-3s %-5s %-10s %s\n' "$b" "$e" "$c" "$s" "$x" "$n"
+			done
+	}
+}
+
+cmd_target() {
+	_action=$1
+	shift
+	case "$_action" in
+		add)
+			_b=$1
+			_c=$2
+			_e=$3
+			[ -n "$_b" ] && [ -n "$_c" ] || { usage; return 1; }
+			_mac=$(printf '%s' "$_b" | tr -d ':' | tr 'a-f' 'A-F')
+			_sec="t_$(printf '%s' "$_mac" | tr 'A-F' 'a-f')"
+			_order=$(uci -q show mrdark 2>/dev/null | grep -c '=target')
+			uci -q set "mrdark.$_sec=target"
+			uci -q set "mrdark.$_sec.bssid=$_b"
+			uci -q set "mrdark.$_sec.channel=$_c"
+			[ -n "$_e" ] && uci -q set "mrdark.$_sec.essid=$_e"
+			uci -q set "mrdark.$_sec.order=$_order"
+			uci -q set "mrdark.$_sec.enabled=1"
+			uci -q commit mrdark
+			echo "added $_sec"
+			# a re-added target always starts from a clean slate
+			rm -f "$MRD_STATE/$_sec".* 2>/dev/null
+			send_cmd reload >/dev/null
+			;;
+		list)
+			if [ -z "$(mrd_queue_sections)" ]; then
+				echo "queue is empty"
+				return 0
+			fi
+			printf '%-22s %-18s %-3s %-8s %s\n' SECTION BSSID CH STATE ESSID
+			for _s in $(mrd_queue_sections); do
+				printf '%-22s %-18s %-3s %-8s %s\n' \
+					"$_s" "$(uci -q get "mrdark.$_s.bssid")" \
+					"$(uci -q get "mrdark.$_s.channel")" \
+					"$(mrd_tget "$_s" status pending)" \
+					"$(uci -q get "mrdark.$_s.essid")"
+			done
+			;;
+		del)
+			_s=$1
+			[ -n "$_s" ] || { usage; return 1; }
+			if ! uci -q show "mrdark.$_s" >/dev/null 2>&1; then
+				_b=$(printf '%s' "$_s" | tr -d ':' | tr 'a-f' 'A-F')
+				_s="t_$(printf '%s' "$_b" | tr 'A-F' 'a-f')"
+			fi
+			if uci -q delete "mrdark.$_s"; then
+				uci -q commit mrdark
+				echo "deleted $_s"
+				rm -f "$MRD_STATE/$_s".* 2>/dev/null
+				send_cmd reload >/dev/null
+			else
+				echo "no such target: $_s" >&2
+				return 1
+			fi
+			;;
+		*)
+			usage
+			return 1
+			;;
+	esac
+}
+
+cmd_artifacts() {
+	_dir=$(mrd_cfg artifacts_dir /root/cap)
+	if [ ! -d "$_dir" ]; then
+		echo "no artefacts yet ($_dir)"
+		return 0
+	fi
+	find "$_dir" -type f 2>/dev/null | sort | while read -r f; do
+		printf '%s  %s\n' "$(du -k "$f" 2>/dev/null | awk '{print $1}')K" "$f"
+	done
+}
+
+case "$1" in
+	scan) shift; cmd_scan "$@" ;;
+	target) shift; cmd_target "$@" ;;
+	start) send_cmd start; echo "job started" ;;
+	stop) send_cmd stop; echo "job stopped" ;;
+	pause) send_cmd pause; echo "paused" ;;
+	resume) send_cmd resume; echo "resumed" ;;
+	skip) send_cmd skip; echo "skipped" ;;
+	clear)
+		# stop the job and drop every target + runtime history (files are kept)
+		for _s in $(mrd_queue_sections); do
+			uci -q delete "mrdark.$_s"
+			rm -f "$MRD_STATE/$_s".* "$MRD_STATE/t.$_s".* 2>/dev/null
+			echo "removed $_s"
+		done
+		uci -q commit mrdark
+		send_cmd stop >/dev/null
+		echo "queue cleared"
+		;;
+	recover) send_cmd recover; sleep 2; echo "radio recovery requested"; /usr/libexec/mrdark/mrdark-status.uc "$(date +%s)" | head -3 ;;
+	status) shift; cmd_status "$@" ;;
+	log)
+		_n=50
+		[ "$2" = "-n" ] && _n=$3
+		tail -n "$_n" "$MRD_LOG" 2>/dev/null
+		;;
+	artifacts) cmd_artifacts ;;
+	verify)
+		shift
+		exec /usr/libexec/mrdark/mrdark-verify attempt "$@"
+		;;
+	""|-h|--help|help) usage ;;
+	*) echo "unknown command: $1"; usage; exit 1 ;;
+esac

@@ -1,0 +1,763 @@
+#!/usr/bin/ucode
+// mrdark-verify - pcap helpers for mrdark
+//
+//   mrdark-verify attempt <file.pcap> --bssid <MAC> [--write-clean <out.pcap>] [--format kv|json]
+//   mrdark-verify scan-networks <file.pcap> [--format json|kv]
+//
+// exit: 0 ok, 1 not valid / nothing found, 2 usage or parse error
+// link types: 105 (IEEE802_11), 127 (radiotap)
+
+import * as fs from 'fs';
+
+const MASK = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+
+// radiotap field sizes and alignments for bits 0..15
+const RT_SZ = [8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2];
+const RT_AL = [8, 1, 1, 2, 2, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2];
+
+function bit(v, n) { return int(v / MASK[n]) % 2; }
+function bit32(v, n) {
+	let m = 1;
+	for (let i = 0; i < n; i++)
+		m *= 2;
+	return int(v / m) % 2;
+}
+
+function u8(s, o) {
+	if (o < 0 || o >= length(s))
+		return 0;
+	return ord(s, o);
+}
+
+function i8(s, o) {
+	let v = u8(s, o);
+	return (v > 127) ? v - 256 : v;
+}
+
+function u16be(s, o) { return u8(s, o) * 256 + u8(s, o + 1); }
+function u16le(s, o) { return u8(s, o) + u8(s, o + 1) * 256; }
+function u32be(s, o) { return u8(s, o) * 16777216 + u8(s, o + 1) * 65536 + u8(s, o + 2) * 256 + u8(s, o + 3); }
+function u32le(s, o) { return u8(s, o) + u8(s, o + 1) * 256 + u8(s, o + 2) * 65536 + u8(s, o + 3) * 16777216; }
+
+function mac(s, o) {
+	let r = '';
+	for (let i = 0; i < 6; i++)
+		r += sprintf(i ? ':%02X' : '%02X', u8(s, o + i));
+	return r;
+}
+
+function is_zero(s) {
+	for (let i = 0; i < length(s); i++)
+		if (ord(s, i) != 0)
+			return false;
+	return true;
+}
+
+function upcase(s) {
+	let r = '';
+	for (let i = 0; i < length(s); i++) {
+		let c = ord(s, i);
+		r += (c >= 97 && c <= 122) ? chr(c - 32) : chr(c);
+	}
+	return r;
+}
+
+function json_str(s) {
+	let r = '"';
+	for (let i = 0; i < length(s); i++) {
+		let c = ord(s, i);
+		if (c == 34) r += '\\"';
+		else if (c == 92) r += '\\\\';
+		else if (c < 32) r += ' ';
+		else r += chr(c);
+	}
+	return r + '"';
+}
+
+// ------------------------------------------------------------------- pcap
+
+function parse_pcap(path) {
+	let buf = fs.readfile(path);
+
+	if (buf == null || length(buf) < 24)
+		return null;
+
+	let m0 = u8(buf, 0), m1 = u8(buf, 1), m2 = u8(buf, 2), m3 = u8(buf, 3);
+	let le;
+
+	if (m0 == 0xd4 && m1 == 0xc3 && m2 == 0xb2 && m3 == 0xa1)
+		le = true;
+	else if (m0 == 0xa1 && m1 == 0xb2 && m2 == 0xc3 && m3 == 0xd4)
+		le = false;
+	else if (m0 == 0x4d && m1 == 0x3c && m2 == 0xb2 && m3 == 0xa1)
+		le = true;
+	else if (m0 == 0xa1 && m1 == 0xb2 && m2 == 0x3c && m3 == 0x4d)
+		le = false;
+	else
+		return null;
+
+	let linktype = le ? u32le(buf, 20) : u32be(buf, 20);
+	let frames = [];
+	let off = 24, n = length(buf);
+
+	while (off + 16 <= n) {
+		let incl = le ? u32le(buf, off + 8) : u32be(buf, off + 8);
+
+		if (incl <= 0 || incl > 262144 || off + 16 + incl > n)
+			break;
+
+		push(frames, { rec: substr(buf, off, 16), data: substr(buf, off + 16, incl) });
+		off += 16 + incl;
+	}
+
+	return { linktype: linktype, hdr: substr(buf, 0, 24), frames: frames };
+}
+
+// strip radiotap, return { off, rssi }
+function strip_radiotap(data) {
+	if (length(data) < 8)
+		return null;
+
+	let hlen = u16le(data, 2);
+
+	if (hlen < 8 || hlen > length(data))
+		return null;
+
+	let pr = 4, words = [], guard = 0;
+
+	while (guard < 4) {
+		let w = u32le(data, pr);
+
+		push(words, w);
+		pr += 4;
+		if (!bit32(w, 31))
+			break;
+		guard++;
+	}
+
+	let off = pr, rssi = null;
+
+	for (let wi = 0; wi < length(words); wi++) {
+		for (let b = 0; b < 32; b++) {
+			if (!bit32(words[wi], b))
+				continue;
+
+			let idx = wi * 32 + b;
+
+			if (idx >= 16)
+				return { off: hlen, rssi: rssi };
+
+			let al = RT_AL[idx], sz = RT_SZ[idx];
+
+			while (off % al != 0)
+				off++;
+			if (idx == 5)
+				rssi = i8(data, off);
+			off += sz;
+		}
+	}
+
+	return { off: hlen, rssi: rssi };
+}
+
+// ----------------------------------------------------------------- beacon
+
+function parse_ies(data, start, end) {
+	let out = {};
+	let p = start;
+
+	while (p + 2 <= end) {
+		let id = u8(data, p), len = u8(data, p + 1);
+
+		if (p + 2 + len > end)
+			break;
+		if (out[id] == null)
+			out[id] = { at: p + 2, len: len };
+		p += 2 + len;
+	}
+
+	return out;
+}
+
+function rsn_info(data, at, len) {
+	if (len < 18)
+		return null;
+
+	// RSN IE: version(2) group(4) pairwise_count(2) pairwise(n*4) akm_count(2) akm(n*4) caps(2)
+	let pw_count = u16le(data, at + 6);
+	let akm_off = at + 8 + 4 * pw_count;
+
+	if (akm_off + 2 > at + len)
+		return null;
+
+	let akm_count = u16le(data, akm_off);
+	let akms = [], q = akm_off + 2;
+
+	for (let i = 0; i < akm_count && q + 4 <= at + len; i++) {
+		let t = u8(data, q + 3);
+
+		if (t == 1) push(akms, '8021X');
+		else if (t == 2) push(akms, 'PSK');
+		else if (t == 3) push(akms, 'FT-8021X');
+		else if (t == 4) push(akms, 'FT-PSK');
+		else if (t == 6) push(akms, 'PSK256');
+		else if (t == 8) push(akms, 'SAE');
+		else if (t == 9) push(akms, 'FT-SAE');
+		else if (t == 18) push(akms, 'OWE');
+		else push(akms, sprintf('AKM%d', t));
+		q += 4;
+	}
+
+	let caps = (q + 2 <= at + len) ? u16le(data, q) : 0;
+
+	return { akm: akms, mfpc: bit(caps, 6), mfpr: bit(caps, 7) };
+}
+
+function beacon_info(data, o, linktype, rssi) {
+	if (o + 36 > length(data))
+		return null;
+
+	let fc0 = u8(data, o);
+
+	if (int(fc0 / 4) % 4 != 0)
+		return null;
+
+	let subtype = int(fc0 / 16) % 16;
+
+	if (subtype != 8 && subtype != 5)
+		return null;
+
+	let bssid = mac(data, o + 16);
+	let caps = u16le(data, o + 34);
+	let ies = parse_ies(data, o + 36, length(data));
+
+	let essid = '';
+
+	if (ies[0] != null && ies[0].len > 0)
+		essid = substr(data, ies[0].at, ies[0].len);
+
+	let channel = 0;
+
+	if (ies[3] != null && ies[3].len >= 1)
+		channel = u8(data, ies[3].at);
+
+	let rsn = null;
+
+	if (ies[48] != null)
+		rsn = rsn_info(data, ies[48].at, ies[48].len);
+
+	return {
+		bssid: bssid,
+		essid: essid,
+		channel: channel,
+		rssi: rssi,
+		privacy: bit(caps, 4),
+		akm: rsn != null ? rsn.akm : [],
+		mfpc: rsn != null ? rsn.mfpc : 0,
+		mfpr: rsn != null ? rsn.mfpr : 0
+	};
+}
+
+// --------------------------------------------------------- scan-networks
+
+function scan_networks(pcap) {
+	let aps = {};
+	let order = [];
+	let clients = {};
+
+	for (let i = 0; i < length(pcap.frames); i++) {
+		let data = pcap.frames[i].data;
+		let rssi = null, o = 0;
+
+		if (pcap.linktype == 127) {
+			let rt = strip_radiotap(data);
+
+			if (rt == null)
+				continue;
+			o = rt.off;
+			rssi = rt.rssi;
+		} else if (pcap.linktype != 105) {
+			continue;
+		}
+
+		if (o + 24 > length(data))
+			continue;
+
+		let fc0 = u8(data, o), fc1 = u8(data, o + 1);
+		let type = int(fc0 / 4) % 4;
+
+		if (type == 0) {
+			let ap = beacon_info(data, o, pcap.linktype, rssi);
+
+			if (ap == null)
+				continue;
+			if (aps[ap.bssid] == null) {
+				aps[ap.bssid] = ap;
+				push(order, ap.bssid);
+			} else {
+				let cur = aps[ap.bssid];
+
+				if (cur.essid == '' && ap.essid != '')
+					cur.essid = ap.essid;
+				if (cur.channel == 0 && ap.channel != 0)
+					cur.channel = ap.channel;
+				if (ap.rssi != null && (cur.rssi == null || ap.rssi > cur.rssi))
+					cur.rssi = ap.rssi;
+				if (ap.akm != null && length(ap.akm) > 0) {
+					cur.akm = ap.akm;
+					cur.mfpr = ap.mfpr;
+					cur.mfpc = ap.mfpc;
+				}
+			}
+			continue;
+		}
+
+		if (type != 2)
+			continue;
+
+		// client bookkeeping from data frames
+		let tods = bit(fc1, 0), fromds = bit(fc1, 1);
+		let bssid = null, sta = null;
+
+		if (tods && !fromds) {
+			bssid = mac(data, o + 4);
+			sta = mac(data, o + 10);
+		} else if (!tods && fromds) {
+			sta = mac(data, o + 4);
+			bssid = mac(data, o + 10);
+		}
+
+		if (bssid == null || sta == null)
+			continue;
+		if (sta == 'FF:FF:FF:FF:FF:FF' || sta == bssid)
+			continue;
+
+		if (clients[bssid] == null)
+			clients[bssid] = {};
+
+		clients[bssid][sta] = 1;
+	}
+
+	let list = [];
+
+	for (let i = 0; i < length(order); i++) {
+		let ap = aps[order[i]];
+		let ncl = (clients[ap.bssid] != null) ? length(clients[ap.bssid]) : 0;
+
+		push(list, {
+			bssid: ap.bssid,
+			essid: ap.essid,
+			channel: ap.channel,
+			rssi: ap.rssi != null ? ap.rssi : 0,
+			privacy: ap.privacy,
+			akm: ap.akm,
+			mfpc: ap.mfpc,
+			mfpr: ap.mfpr,
+			clients: ncl
+		});
+	}
+
+	return list;
+}
+
+function networks_json(list) {
+	let o = '[';
+	let first = true;
+
+	for (let i = 0; i < length(list); i++) {
+		let n = list[i];
+		let akm = '';
+		let enc = n.privacy ? 'WPA' : 'OPEN';
+		let fiveg = (n.channel > 14);
+
+		for (let j = 0; j < length(n.akm); j++)
+			akm += (j ? '+' : '') + n.akm[j];
+
+		if (n.privacy) {
+			if (akm == '') enc = 'WEP';
+			else if (akm == 'SAE' || akm == 'FT-SAE') enc = 'WPA3';
+			else if (n.mfpr) enc = 'WPA2-PMF';
+			else enc = 'WPA2';
+		}
+
+		if (!first)
+			o += ',';
+		first = false;
+
+		o += sprintf('{"bssid":%s,"essid":%s,"channel":%d,"rssi":%d,"privacy":%s,"enc":"%s","akm":%s,"pmf":%s,"pmf_required":%s,"clients":%d,"is_5ghz":%s}', 
+			json_str(n.bssid), json_str(n.essid), n.channel, n.rssi,
+			n.privacy ? 'true' : 'false', enc, json_str(akm),
+			n.mfpc ? 'true' : 'false', n.mfpr ? 'true' : 'false',
+			n.clients, fiveg ? 'true' : 'false');
+	}
+
+	return o + ']';
+}
+
+// ------------------------------------------------------------ EAPOL attempt
+
+function parse_eapol(data, linktype) {
+	let o = 0;
+
+	if (linktype == 127) {
+		let rt = strip_radiotap(data);
+
+		if (rt == null)
+			return null;
+		o = rt.off;
+	} else if (linktype != 105) {
+		return null;
+	}
+
+	if (o + 24 > length(data))
+		return null;
+
+	let fc0 = u8(data, o), fc1 = u8(data, o + 1);
+
+	if (int(fc0 / 4) % 4 != 2)
+		return null;
+
+	let subtype = int(fc0 / 16) % 16;
+	let tods = bit(fc1, 0), fromds = bit(fc1, 1);
+
+	if (tods && fromds)
+		return null;
+
+	let hdr = 24;
+
+	if (bit(subtype, 3))
+		hdr += 2;
+	if (bit(fc1, 7))
+		hdr += 4;
+
+	let p = o + hdr;
+
+	if (p + 8 > length(data))
+		return null;
+	if (u8(data, p) != 0xaa || u8(data, p + 1) != 0xaa || u8(data, p + 2) != 0x03)
+		return null;
+	if (u16be(data, p + 6) != 0x888e)
+		return null;
+
+	let e = p + 8;
+
+	if (e + 99 > length(data))
+		return null;
+	if (u8(data, e + 1) != 3 || u8(data, e + 4) != 2)
+		return null;
+
+	let ki = u16be(data, e + 5);
+
+	if (!bit(ki, 3))
+		return null;
+
+	let ack = bit(ki, 7), mic = bit(ki, 8), secure = bit(ki, 9);
+	let msg = 0;
+
+	if (ack && !mic)
+		msg = 1;
+	else if (ack && mic)
+		msg = 3;
+	else if (!ack && mic && secure)
+		msg = 4;
+	else if (!ack && mic)
+		msg = 2;
+	else
+		return null;
+
+	return {
+		msg: msg,
+		rc: u32be(data, e + 9) * 4294967296 + u32be(data, e + 13),
+		nonce: substr(data, e + 17, 32),
+		mic: substr(data, e + 81, 16),
+		bssid: mac(data, tods ? o + 4 : o + 10),
+		sta: mac(data, tods ? o + 10 : o + 4)
+	};
+}
+
+function pair_ok(nonce_ap, nonce_sta, mic) {
+	return !is_zero(nonce_ap) && !is_zero(nonce_sta) &&
+	       nonce_ap != nonce_sta && !is_zero(mic);
+}
+
+function pick_pair(g) {
+	for (let i = 0; i < length(g.m1); i++)
+		for (let j = 0; j < length(g.m2); j++)
+			if (g.m1[i].rc == g.m2[j].rc && pair_ok(g.m1[i].nonce, g.m2[j].nonce, g.m2[j].mic))
+				return { pair: 'M1+M2', a: g.m1[i], b: g.m2[j] };
+
+	for (let j = 0; j < length(g.m2); j++)
+		for (let k = 0; k < length(g.m3); k++)
+			if (g.m3[k].rc == g.m2[j].rc + 1 && pair_ok(g.m3[k].nonce, g.m2[j].nonce, g.m3[k].mic))
+				return { pair: 'M2+M3', a: g.m3[k], b: g.m2[j] };
+
+	for (let k = 0; k < length(g.m3); k++)
+		for (let l = 0; l < length(g.m4); l++)
+			if (g.m3[k].rc == g.m4[l].rc && pair_ok(g.m3[k].nonce, g.m4[l].nonce, g.m4[l].mic))
+				return { pair: 'M3+M4', a: g.m3[k], b: g.m4[l] };
+
+	return null;
+}
+
+function analyse(pcap, want_bssid) {
+	let groups = {};
+
+	for (let i = 0; i < length(pcap.frames); i++) {
+		let ev = parse_eapol(pcap.frames[i].data, pcap.linktype);
+
+		if (ev == null)
+			continue;
+		if (want_bssid != null && ev.bssid != want_bssid)
+			continue;
+
+		let key = ev.bssid + '|' + ev.sta;
+
+		if (groups[key] == null)
+			groups[key] = { m1: [], m2: [], m3: [], m4: [] };
+
+		let slot = groups[key]['m' + ev.msg], dup = false;
+
+		for (let j = 0; j < length(slot); j++)
+			if (slot[j].rc == ev.rc && slot[j].nonce == ev.nonce && slot[j].mic == ev.mic)
+				dup = true;
+		if (dup)
+			continue;
+
+		push(slot, ev);
+	}
+
+	let res = {
+		valid: false, pair: null, bssid: null, sta: null,
+		counts: { m1: 0, m2: 0, m3: 0, m4: 0 },
+		candidates: 0, best: null
+	};
+
+	for (let key in groups) {
+		let g = groups[key];
+
+		res.candidates++;
+		res.counts.m1 += length(g.m1);
+		res.counts.m2 += length(g.m2);
+		res.counts.m3 += length(g.m3);
+		res.counts.m4 += length(g.m4);
+
+		if (res.valid)
+			continue;
+
+		let p = pick_pair(g);
+
+		if (p != null) {
+			let parts = split(key, '|');
+
+			res.valid = true;
+			res.pair = p.pair;
+			res.bssid = parts[0];
+			res.sta = parts[1];
+			res.best = p;
+		}
+	}
+
+	return res;
+}
+
+// BSSID of a beacon / probe response frame, null otherwise
+function mgmt_bssid(data, linktype) {
+	let o = 0;
+
+	if (linktype == 127) {
+		let rt = strip_radiotap(data);
+
+		if (rt == null)
+			return null;
+		o = rt.off;
+	} else if (linktype != 105) {
+		return null;
+	}
+
+	if (o + 36 > length(data))
+		return null;
+
+	let fc0 = u8(data, o);
+
+	if (int(fc0 / 4) % 4 != 0)
+		return null;
+
+	let st = int(fc0 / 16) % 16;
+
+	if (st != 8 && st != 5)
+		return null;
+
+	return mac(data, o + 16);
+}
+
+function write_clean(path, pcap, res) {
+	if (res.best == null)
+		return false;
+
+	let frames = [], beacon = null;
+
+	// keep every EAPOL frame of the selected station (M1..M4 + retransmits)
+	// plus one beacon of the target BSSID, so the artefact also carries the
+	// network name for aircrack/Wireshark
+	for (let i = 0; i < length(pcap.frames); i++) {
+		let data = pcap.frames[i].data;
+		let ev = parse_eapol(data, pcap.linktype);
+
+		if (ev != null) {
+			if (ev.bssid == res.bssid && ev.sta == res.sta)
+				push(frames, pcap.frames[i]);
+			continue;
+		}
+
+		if (beacon == null) {
+			let b = mgmt_bssid(data, pcap.linktype);
+
+			if (b != null && b == res.bssid)
+				beacon = pcap.frames[i];
+		}
+	}
+
+	if (length(frames) < 2)
+		return false;
+
+	let out = pcap.hdr;
+
+	if (beacon != null)
+		out += beacon.rec + beacon.data;
+
+	for (let i = 0; i < length(frames); i++)
+		out += frames[i].rec + frames[i].data;
+
+	return fs.writefile(path, out) != null;
+}
+
+function kv_out(res, clean) {
+	let o = sprintf('valid=%d\n', res.valid ? 1 : 0);
+
+	o += sprintf('bssid=%s\n', res.bssid != null ? res.bssid : '');
+	o += sprintf('sta=%s\n', res.sta != null ? res.sta : '');
+	o += sprintf('pair=%s\n', res.pair != null ? res.pair : '');
+	o += sprintf('m1=%d\n', res.counts.m1);
+	o += sprintf('m2=%d\n', res.counts.m2);
+	o += sprintf('m3=%d\n', res.counts.m3);
+	o += sprintf('m4=%d\n', res.counts.m4);
+	o += sprintf('sta_candidates=%d\n', res.candidates);
+	if (clean != null)
+		o += sprintf('clean_written=%s\n', clean);
+
+	return o;
+}
+
+function json_out(res, clean) {
+	let o = sprintf('{"valid":%s,', res.valid ? 'true' : 'false');
+
+	o += sprintf('"bssid":%s,', res.bssid != null ? '"' + res.bssid + '"' : 'null');
+	o += sprintf('"sta":%s,', res.sta != null ? '"' + res.sta + '"' : 'null');
+	o += sprintf('"pair":%s,', res.pair != null ? '"' + res.pair + '"' : 'null');
+	o += sprintf('"counts":{"m1":%d,"m2":%d,"m3":%d,"m4":%d},',
+		res.counts.m1, res.counts.m2, res.counts.m3, res.counts.m4);
+	o += sprintf('"sta_candidates":%d', res.candidates);
+	if (clean != null)
+		o += sprintf(',"clean_written":"%s"', clean);
+
+	return o + '}\n';
+}
+
+// ------------------------------------------------------------------- main
+
+function merge_network_list(acc, idx, list) {
+	for (let i = 0; i < length(list); i++) {
+		let n = list[i];
+
+		if (idx[n.bssid] == null) {
+			idx[n.bssid] = length(acc);
+			push(acc, n);
+			continue;
+		}
+
+		let cur = acc[idx[n.bssid]];
+
+		if (cur.essid == '' && n.essid != '')
+			cur.essid = n.essid;
+		if (cur.channel == 0 && n.channel != 0)
+			cur.channel = n.channel;
+		if (n.rssi > cur.rssi)
+			cur.rssi = n.rssi;
+		if (length(cur.akm) == 0 && length(n.akm) > 0) {
+			cur.akm = n.akm;
+			cur.mfpc = n.mfpc;
+			cur.mfpr = n.mfpr;
+		}
+		if (n.clients > cur.clients)
+			cur.clients = n.clients;
+	}
+	return acc;
+}
+
+function main() {
+	let mode = length(ARGV) > 0 ? ARGV[0] : null;
+	let path = length(ARGV) > 1 ? ARGV[1] : null;
+	let bssid = null, clean_path = null, format = 'json';
+
+	for (let i = 2; i < length(ARGV); i++) {
+		if (ARGV[i] == '--bssid' && i + 1 < length(ARGV))
+			bssid = upcase(ARGV[++i]);
+		else if (ARGV[i] == '--write-clean' && i + 1 < length(ARGV))
+			clean_path = ARGV[++i];
+		else if (ARGV[i] == '--format' && i + 1 < length(ARGV))
+			format = ARGV[++i];
+	}
+
+	if (mode == null || path == null || (mode != 'attempt' && mode != 'scan-networks')) {
+		print('usage: mrdark-verify attempt|scan-networks <file.pcap...> [--bssid MAC] [--write-clean OUT] [--format json|kv]\n');
+		return 2;
+	}
+
+	if (mode == 'scan-networks') {
+		let acc = [], idx = {}, files = 0;
+
+		for (let i = 1; i < length(ARGV); i++) {
+			if (ARGV[i] == '--format') { i++; continue; }
+			if (substr(ARGV[i], 0, 2) == '--') continue;
+
+			let p = parse_pcap(ARGV[i]);
+
+			if (p == null)
+				continue;
+			files++;
+			merge_network_list(acc, idx, scan_networks(p));
+		}
+
+		if (files == 0) {
+			print('error: no readable pcap\n');
+			return 2;
+		}
+
+		print(networks_json(acc) + '\n');
+		return length(acc) > 0 ? 0 : 1;
+	}
+
+	let pcap = parse_pcap(path);
+
+	if (pcap == null) {
+		print('error: not a pcap file or unreadable: ' + path + '\n');
+		return 2;
+	}
+
+	let res = analyse(pcap, bssid);
+	let clean = null;
+
+	if (clean_path != null && res.valid) {
+		if (write_clean(clean_path, pcap, res))
+			clean = clean_path;
+	}
+
+	if (format == 'kv')
+		print(kv_out(res, clean));
+	else
+		print(json_out(res, clean));
+
+	return res.valid ? 0 : 1;
+}
+
+exit(main());

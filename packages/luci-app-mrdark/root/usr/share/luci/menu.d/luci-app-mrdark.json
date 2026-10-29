@@ -1,0 +1,13 @@
+{
+	"admin/network/mrdark": {
+		"title": "mrdark",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "mrdark"
+		},
+		"depends": {
+			"acl": [ "luci-app-mrdark" ]
+		}
+	}
+}

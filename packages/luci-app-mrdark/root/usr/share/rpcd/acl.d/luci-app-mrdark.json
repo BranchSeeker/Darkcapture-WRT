@@ -1,0 +1,22 @@
+{
+	"luci-app-mrdark": {
+		"description": "Grant access to the mrdark capture control",
+		"read": {
+			"ubus": {
+				"mrdark": [ "*" ],
+				"file": [ "read", "stat" ]
+			},
+			"uci": [ "mrdark" ],
+			"file": {
+				"/root/cap/*": [ "read" ],
+				"/root/cap/*/*": [ "read" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"mrdark": [ "*" ]
+			},
+			"uci": [ "mrdark" ]
+		}
+	}
+}
