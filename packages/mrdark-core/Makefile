@@ -33,6 +33,13 @@ define Package/mrdark-core/conffiles
 /etc/config/mrdark
 endef
 
+# Nothing to compile: the package ships shell/ucode files only, and they are
+# installed verbatim from ./files by Package/mrdark-core/install.  Without this
+# override Build/Compile/Default would run "make -C $(PKG_BUILD_DIR)" in an
+# empty directory and fail with "No targets specified and no makefile found".
+define Build/Compile
+endef
+
 define Package/mrdark-core/install
 	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d $(1)/etc/uci-defaults
 	$(INSTALL_DIR) $(1)/usr/bin $(1)/usr/libexec/mrdark
