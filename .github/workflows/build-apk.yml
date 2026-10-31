@@ -30,7 +30,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -83,10 +83,19 @@ jobs:
           # have tmp/.packageinfo from feeds install.
           rm -rf tmp
 
+          # The SDK ships no .config, and its ALL* defaults are fatal here:
+          #   CONFIG_ALL / CONFIG_ALL_NONSHARED / CONFIG_ALL_KMODS = y
+          # select every package of the tree, so package dependency edges pull
+          # package/toolchain in, whose install step tries to copy libasan.so
+          # from a musl toolchain that does not have it.  Selecting only the
+          # two packages we need avoids that entire dependency graph.
           if [ -f .config ]; then
             sed -i '/^CONFIG_PACKAGE_mrdark-core/d; /^CONFIG_PACKAGE_luci-app-mrdark/d; /^CONFIG_PACKAGE_luci-base/d' .config
           fi
           cat >> .config <<'EOF'
+          # CONFIG_ALL is not set
+          # CONFIG_ALL_NONSHARED is not set
+          # CONFIG_ALL_KMODS is not set
           CONFIG_PACKAGE_mrdark-core=y
           CONFIG_PACKAGE_luci-app-mrdark=y
           CONFIG_PACKAGE_luci-base=y
@@ -102,30 +111,39 @@ jobs:
             fi
           done
 
+          # Diagnostics kept in build.log for the failure summary / artifact.
+          echo "== selected packages =="
+          grep -E '^CONFIG_PACKAGE_(mrdark-core|luci-app-mrdark|luci-base)=y$' .config
+          echo "== ALL switches =="
+          grep -E 'CONFIG_ALL(_NONSHARED|_KMODS)?' .config || true
+          echo "== package metadata =="
+          grep -c 'mrdark-core' tmp/.packageinfo || true
+
       - name: Build mrdark-core
         run: |
           set -euo pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
           cd "$SDK_DIR"
-          make DEVELOPER=1 package/mrdark-core/compile V=s
+          # Build inside the package dir on purpose: the outer
+          # `make package/<name>/compile` target carries the dependency edges
+          # generated in tmp/.packagedeps, and for a pure noarch package those
+          # edges only add work (and break the SDK, see Prepare SDK).
+          make -C package/mrdark-core compile V=s
+          if ! find bin/packages -name 'mrdark-core-*.apk' | grep -q .; then
+            echo "WARNING: no APK after 'compile', retrying with '.compile'" >&2
+            make -C package/mrdark-core .compile V=s
+          fi
 
       - name: Build LuCI app
         run: |
           set -euo pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
           cd "$SDK_DIR"
-          make DEVELOPER=1 package/luci-app-mrdark/compile V=s
-
-      - name: Show build log on failure
-        if: failure()
-        run: |
-          sleep 1
-          {
-            echo '## Build failed'
-            echo '```'
-            tail -n 120 "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          make -C package/luci-app-mrdark compile V=s
+          if ! find bin/packages -name 'luci-app-mrdark-*.apk' | grep -q .; then
+            echo "WARNING: no APK after 'compile', retrying with '.compile'" >&2
+            make -C package/luci-app-mrdark .compile V=s
+          fi
 
       - name: Collect APK files
         run: |
@@ -135,9 +153,32 @@ jobs:
             \( -name 'mrdark-core-*.apk' -o -name 'luci-app-mrdark-*.apk' \) \
             -exec cp -v {} dist/ \;
           count="$(find dist -maxdepth 1 -type f -name '*.apk' | wc -l)"
-          test "$count" -eq 2
+          if [ "$count" -ne 2 ]; then
+            echo "ERROR: expected 2 APK files, found $count" >&2
+            find "$SDK_DIR/bin/packages" -type f -name '*.apk' | head -20 >&2 || true
+            exit 1
+          fi
           (cd dist && sha256sum ./*.apk > SHA256SUMS)
           ls -lh dist
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Show build log on failure
+        if: failure()
+        run: |
+          {
+            echo '## Build failed'
+            echo '```'
+            tail -n 150 "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
