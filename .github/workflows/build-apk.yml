@@ -29,7 +29,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
@@ -66,9 +66,10 @@ jobs:
           rm -f /tmp/sdk.tar.zst
           echo "SDK_DIR=$RUNNER_TEMP/sdk" >> "$GITHUB_ENV"
 
-      - name: Build packages
+      - name: Prepare SDK
         run: |
           set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
           cd "$SDK_DIR"
 
           ./scripts/feeds update -a
@@ -78,7 +79,10 @@ jobs:
           cp -r "$GITHUB_WORKSPACE/packages/mrdark-core" package/
           cp -r "$GITHUB_WORKSPACE/packages/luci-app-mrdark" package/
 
-          # OpenWrt only enables the compile target of selected packages.
+          # Force a package rescan: after copying sources the SDK may still
+          # have tmp/.packageinfo from feeds install.
+          rm -rf tmp
+
           if [ -f .config ]; then
             sed -i '/^CONFIG_PACKAGE_mrdark-core/d; /^CONFIG_PACKAGE_luci-app-mrdark/d; /^CONFIG_PACKAGE_luci-base/d' .config
           fi
@@ -89,10 +93,39 @@ jobs:
           EOF
 
           make defconfig
-          # luci.mk declares luci-base/host and lua/host as build dependencies;
-          # the OpenWrt build system builds them before the LuCI app.
-          make package/mrdark-core/compile V=s
-          make package/luci-app-mrdark/compile V=s
+
+          for pkg in mrdark-core luci-app-mrdark luci-base; do
+            if ! grep -q "^CONFIG_PACKAGE_${pkg}=y$" .config; then
+              echo "ERROR: CONFIG_PACKAGE_${pkg}=y is missing after make defconfig" >&2
+              grep -n "CONFIG_PACKAGE_${pkg}" .config >&2 || true
+              exit 1
+            fi
+          done
+
+      - name: Build mrdark-core
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+          cd "$SDK_DIR"
+          make DEVELOPER=1 package/mrdark-core/compile V=s
+
+      - name: Build LuCI app
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+          cd "$SDK_DIR"
+          make DEVELOPER=1 package/luci-app-mrdark/compile V=s
+
+      - name: Show build log on failure
+        if: failure()
+        run: |
+          sleep 1
+          {
+            echo '## Build failed'
+            echo '```'
+            tail -n 120 "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect APK files
         run: |
